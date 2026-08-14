@@ -67,9 +67,9 @@ jobs:
         host: [darwin-arm64, darwin-x86_64, windows-x86_64]
         include:
           - host: darwin-arm64
-            runner: macos-14
+            runner: macos-latest
           - host: darwin-x86_64
-            runner: macos-13
+            runner: macos-15-intel
           - host: windows-x86_64
             runner: windows-latest
     runs-on: ${{ matrix.runner }}

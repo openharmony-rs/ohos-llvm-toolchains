@@ -40,6 +40,12 @@ jobs:
         run: echo "${{ steps.sdk.outputs.sdk-path }}/linux/toolchains" >> "$GITHUB_PATH"
       - name: Install qemu (aarch64 user-mode, for static smoke tests)
         run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
       - name: Start Oniro emulator
         id: emulator
         uses: openharmony-rs/emulator-action@v1

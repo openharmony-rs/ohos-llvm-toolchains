@@ -1,0 +1,46 @@
+name: Mirror release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Toolchain version key from toolchains.json (e.g. 19.1.4-79830f)"
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate before mirroring
+        run: scripts/ohos_toolchain.py validate "${{ inputs.version }}" linux-x86_64
+      - name: Fetch and verify all host archives
+        run: scripts/ohos_toolchain.py fetch "${{ inputs.version }}" dist
+      # Provenance: attests that these exact bytes were fetched from the pinned
+      # upstream URLs and passed this repository's validation pipeline. It does
+      # NOT attest how the OpenHarmony project built them.
+      - name: Attest artifacts
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ inputs.version }}"
+          NOTES="Mirror of the OpenHarmony LLVM toolchain \`$V\` from \
+          $(jq -r .mirror_base toolchains.json)/$V/. \
+          Checksums in SHA256SUMS match the manifest pinned in this repository \
+          at the mirrored commit. See README.md for the toolchain layout and \
+          the libc++ flavor notes."
+          gh release create "toolchain-$V" \
+            --title "OpenHarmony LLVM toolchain $V (mirror)" \
+            --notes "$NOTES" \
+            dist/*

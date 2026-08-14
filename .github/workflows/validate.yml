@@ -1,0 +1,79 @@
+name: Validate toolchains
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly: detect the upstream mirror changing or dropping pinned archives.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.list.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: list
+        run: |
+          echo "versions=$(python3 -c "import json; print(json.dumps(sorted(json.load(open('toolchains.json'))['toolchains'])))")" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup OpenHarmony SDK (sysroot + hdc)
+        id: sdk
+        uses: openharmony-rs/setup-ohos-sdk@v1.0
+        with:
+          version: "5.0.2"
+          components: "native;toolchains"
+          mirror: true
+      - name: Add hdc to PATH
+        run: echo "${{ steps.sdk.outputs.sdk-path }}/linux/toolchains" >> "$GITHUB_PATH"
+      - name: Install qemu (aarch64 user-mode, for static smoke tests)
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - name: Start Oniro emulator
+        id: emulator
+        uses: openharmony-rs/emulator-action@v1
+        with:
+          release: v6.0
+      - name: Validate (full; smoke tests under qemu and on the emulator)
+        env:
+          OHOS_SDK_NATIVE: ${{ steps.sdk.outputs.ohos_sdk_native }}
+        run: scripts/ohos_toolchain.py validate "${{ matrix.version }}" linux-x86_64 --full --device
+      # Composite actions cannot register a post: step, so keep the emulator log ourselves.
+      - name: Upload emulator log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: oniro-emulator-log-${{ matrix.version }}
+          path: ${{ steps.emulator.outputs.log-path }}
+          if-no-files-found: warn
+
+  other-hosts:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+        host: [darwin-arm64, darwin-x86_64, windows-x86_64]
+        include:
+          - host: darwin-arm64
+            runner: macos-14
+          - host: darwin-x86_64
+            runner: macos-13
+          - host: windows-x86_64
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate (checksums, layout, ABI namespace)
+        run: python3 scripts/ohos_toolchain.py validate "${{ matrix.version }}" "${{ matrix.host }}"

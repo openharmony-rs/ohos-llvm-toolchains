@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "mirror_base": "https://repo.huaweicloud.com/openharmony/compiler/clang",
+  "toolchains": {
+    "19.1.4-79830f": {
+      "llvm_version": "19.1.4",
+      "upstream_git_sha": "495f8da2ff02b3873967384ab0ba1378ee79830f",
+      "date": "20260223",
+      "status": "preview",
+      "libcpp_version": 190104,
+      "abi_namespace": {
+        "toolchain": "__h",
+        "ndk": "__n1"
+      },
+      "targets": [
+        "aarch64-linux-ohos",
+        "arm-linux-ohos",
+        "x86_64-linux-ohos"
+      ],
+      "hosts": {
+        "linux-x86_64": {
+          "dir": "linux",
+          "clang": {
+            "file": "clang_linux-x86_64-79830f-20260223.tar.gz",
+            "sha256": "b718e3402be9ef07f42c7a3167332cd9b4e9d340166fae65c84dd72b494bf3fc"
+          },
+          "libcxx_ndk": {
+            "file": "libcxx-ndk_linux-x86_64-79830f-20260223.tar.gz",
+            "sha256": "906081e5deb3e8484ead36dfd5b6afdbfbe2f7e0d44d57846133e20a538d3d20"
+          }
+        },
+        "darwin-arm64": {
+          "dir": "darwin_arm64",
+          "clang": {
+            "file": "clang_darwin-arm64-79830f-20260223.tar.gz",
+            "sha256": "299ebbf362ef4287964eb2c65d63777dbab0f80827a85aaea28d15953596e235"
+          },
+          "libcxx_ndk": {
+            "file": "libcxx-ndk_darwin-arm64-79830f-20260223.tar.gz",
+            "sha256": "d558a1fb35ed2c81d03487605730edd8d88f00b8ad4c29059ff8f29438c04bbf"
+          }
+        },
+        "darwin-x86_64": {
+          "dir": "darwin_x86_64",
+          "clang": {
+            "file": "clang_darwin-x86_64-79830f-20260223.tar.gz",
+            "sha256": "e29256a9e90dc0e0ca33ae2f23aaf2510b6b06897389369cba3f2c02595cb5b7"
+          },
+          "libcxx_ndk": {
+            "file": "libcxx-ndk_darwin-x86_64-79830f-20260223.tar.gz",
+            "sha256": "0233eee2addeb2b15a8f455a798d163d0d2ce55a091f9040a87c61700450aca6"
+          }
+        },
+        "windows-x86_64": {
+          "dir": "windows",
+          "clang": {
+            "file": "clang_windows-x86_64-79830f-20260223.tar.gz",
+            "sha256": "2bb235968c6c1dedeb05f55d247a58072b5153cc7e9f1ed2d2c613a0aa8f6647"
+          },
+          "libcxx_ndk": {
+            "file": "libcxx-ndk_windows-x86_64-79830f-20260223.tar.gz",
+            "sha256": "99c3a31ca886da6e0803aa46476246e2396fdbfececdf6ea3e39e7ed454bd756"
+          }
+        }
+      }
+    }
+  }
+}

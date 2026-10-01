@@ -1,0 +1,68 @@
+From e01b39662ced79942a29125947a0beb8f90684c5 Mon Sep 17 00:00:00 2001
+From: Jonathan Schwender <schwenderjonathan@gmail.com>
+Date: Thu, 1 Oct 2026 12:22:58 +0000
+Subject: [PATCH] [TSan][OHOS] Restore all signal-handler ignore state on
+ longjmp
+
+openharmony-rs patch, not part of the OpenHarmony LLVM fork.
+
+CallUserSignalHandler clears ignore_reads_and_writes, ignore_interceptors,
+ignore_sync and in_symbolizer before calling a synchronous signal handler,
+and restores them only if the handler returns. b46f37dd47 made LongJmp
+restore ignore_reads_and_writes for a handler that longjmps out; the other
+three stay cleared.
+
+On OpenHarmony this happens on every first report: the report is printed
+under ScopedIgnoreInterceptors, ohos_dfx_log dlopens libasan_logger, and
+OpenSSL's CPU feature probe in there catches SIGILL with sigsetjmp/
+siglongjmp on cores without the probed instructions (e.g. Cortex-A55).
+Interceptors entered while ignored then exit while not ignored, so the
+shadow stack underflows and the next function entry writes below it:
+SIGSEGV, or silent corruption when the memory below happens to be mapped.
+
+Save and restore the other three alongside ignore_reads_and_writes.
+---
+ compiler-rt/lib/tsan/rtl/tsan_interceptors_posix.cpp | 6 ++++++
+ compiler-rt/lib/tsan/rtl/tsan_rtl.h                  | 5 +++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_interceptors_posix.cpp b/compiler-rt/lib/tsan/rtl/tsan_interceptors_posix.cpp
+index 19b895662..953bc2b8c 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_interceptors_posix.cpp
++++ b/compiler-rt/lib/tsan/rtl/tsan_interceptors_posix.cpp
+@@ -563,6 +563,9 @@ static void SetJmp(ThreadState *thr, uptr sp) {
+   buf->shadow_stack_pos = thr->shadow_stack_pos;
+ #if SANITIZER_OHOS
+   buf->ignore_reads_and_writes = thr->ignore_reads_and_writes;
++  buf->ignore_interceptors = thr->ignore_interceptors;
++  buf->ignore_sync = thr->ignore_sync;
++  buf->in_symbolizer = thr->in_symbolizer;
+ #endif
+   ThreadSignalContext *sctx = SigCtx(thr);
+   buf->int_signal_send = sctx ? sctx->int_signal_send : 0;
+@@ -596,6 +599,9 @@ static void LongJmp(ThreadState *thr, uptr *env) {
+         thr->fast_state.SetIgnoreBit();
+       else
+         thr->fast_state.ClearIgnoreBit();
++      thr->ignore_interceptors = buf->ignore_interceptors;
++      thr->ignore_sync = buf->ignore_sync;
++      thr->in_symbolizer = buf->in_symbolizer;
+ #endif
+       atomic_store(&thr->in_signal_handler, buf->in_signal_handler,
+           memory_order_relaxed);
+diff --git a/compiler-rt/lib/tsan/rtl/tsan_rtl.h b/compiler-rt/lib/tsan/rtl/tsan_rtl.h
+index d63ce8989..7ae3d676a 100644
+--- a/compiler-rt/lib/tsan/rtl/tsan_rtl.h
++++ b/compiler-rt/lib/tsan/rtl/tsan_rtl.h
+@@ -102,6 +102,11 @@ struct JmpBuf {
+ #if SANITIZER_OHOS
+   // Restore the ignore state if longjmp escapes an ignored signal context.
+   int ignore_reads_and_writes;
++  // CallUserSignalHandler clears these too, and only restores them if the
++  // handler returns.
++  int ignore_interceptors;
++  int ignore_sync;
++  int in_symbolizer;
+ #endif
+   bool in_blocking_func;
+   uptr oldset_stack_size;

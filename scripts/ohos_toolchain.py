@@ -31,6 +31,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = REPO_ROOT / "toolchains.json"
 
 TESTS_DIR = REPO_ROOT / "tests"
+SANITIZER_TESTS_DIR = TESTS_DIR / "sanitizers"
+SANITIZER_RUNTIMES = {"address": "asan", "thread": "tsan"}
 DEVICE_DIR = "/data/local/tmp/ohos-llvm-validate"
 
 
@@ -94,11 +96,15 @@ def fetch_archive(work: Path, base: str, version: str, host_dir: str, entry: dic
             f"  expected: {entry['sha256']}\n  got:      {got}"
         )
     print(f"== sha256 OK: {entry['file']}")
+    return extract_archive(work, dest)
+
+
+def extract_archive(work: Path, archive: Path) -> Path:
     top = subprocess.run(
-        ["tar", "tzf", str(dest)], capture_output=True, text=True, check=True
+        ["tar", "tzf", str(archive)], capture_output=True, text=True, check=True
     ).stdout.splitlines()[0].split("/")[0]
     if not (work / top).is_dir():
-        subprocess.run(["tar", "xzf", str(dest), "-C", str(work)], check=True)
+        subprocess.run(["tar", "xzf", str(archive), "-C", str(work)], check=True)
     return work / top
 
 
@@ -141,9 +147,10 @@ def hdc(key: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
-def device_run(key: str, binary: Path, marker: str, lib: Path | None = None) -> tuple[bool, str]:
+def device_run(key: str, binary: Path, marker: str, lib: Path | None = None,
+               require_success: bool = True) -> tuple[bool, str]:
     """Push a binary (and optionally a shared library) to the device, run it,
-    and report whether its output contains the marker."""
+    and report whether its output contains the marker (and it exited 0)."""
     name = binary.name
     hdc(key, "shell", f"mkdir -p {DEVICE_DIR}/lib")
     sent = hdc(key, "file", "send", str(binary), f"{DEVICE_DIR}/{name}")
@@ -160,7 +167,7 @@ def device_run(key: str, binary: Path, marker: str, lib: Path | None = None) -> 
         f"LD_LIBRARY_PATH={DEVICE_DIR}/lib {DEVICE_DIR}/{name}; echo exit:$?",
     )
     text = out.stdout + out.stderr
-    return marker in text and "exit:0" in text, text.strip()
+    return marker in text and (not require_success or "exit:0" in text), text.strip()
 
 
 def cmd_validate(args):
@@ -177,9 +184,20 @@ def cmd_validate(args):
     work.mkdir(parents=True, exist_ok=True)
     print(f"== work dir: {work}")
 
-    base = manifest["mirror_base"]
-    clang_dir = fetch_archive(work, base, args.version, host["dir"], host["clang"])
-    ndk_dir = fetch_archive(work, base, args.version, host["dir"], host["libcxx_ndk"])
+    if "source" in entry:
+        # Built by scripts/build_toolchain.py, so there is no upstream checksum to pin.
+        if not args.archive:
+            sys.exit(f"error: {args.version} is built from source; pass --archive with the "
+                     "archive `scripts/build_toolchain.py package` wrote")
+        archive = Path(args.archive)
+        print(f"== sha256 of {archive.name}: {sha256_file(archive)}")
+        clang_dir = extract_archive(work, archive)
+        ndk_dir = None
+    else:
+        base = manifest["mirror_base"]
+        clang_dir = fetch_archive(work, base, args.version, host["dir"], host["clang"])
+        ndk_dir = fetch_archive(work, base, args.version, host["dir"], host["libcxx_ndk"])
+    flavors = [("toolchain", clang_dir)] + ([("ndk", ndk_dir)] if ndk_dir else [])
 
     c = Checker()
 
@@ -192,7 +210,8 @@ def cmd_validate(args):
 
     v1 = "include/libcxx-ohos/include/c++/v1"
     ns = entry["abi_namespace"]
-    for flavor, root, want in (("toolchain", clang_dir, ns["toolchain"]), ("ndk", ndk_dir, ns["ndk"])):
+    for flavor, root in flavors:
+        want = ns[flavor]
         site = root / v1 / "__config_site"
         text = site.read_text() if site.is_file() else ""
         c.check(
@@ -222,7 +241,7 @@ def cmd_validate(args):
     abi_target = "aarch64-linux-ohos"
     abi_dir = REPO_ROOT / "abi" / args.version
     if nm:
-        for flavor, root in (("toolchain", clang_dir), ("ndk", ndk_dir)):
+        for flavor, root in flavors:
             so = root / "lib" / abi_target / "libc++.so"
             p = subprocess.run([nm, "-D", "--defined-only", str(so)], capture_output=True, text=True, check=True)
             current = sorted({line.split()[2] for line in p.stdout.splitlines() if len(line.split()) == 3})
@@ -323,9 +342,46 @@ def run_full(args, entry, clang_dir: Path, c: Checker, work: Path):
                 lib = clang_dir / "lib" / triple / "libc++.so" if src.suffix == ".cpp" else None
                 ok, out = device_run(device, dev_shared, marker, lib)
                 c.check(f"{src.name}: shared binary runs on device", ok, out)
+        if device is not None:
+            run_sanitizer_tests(args, entry, clang_dir, c, work, device, sysroot)
     finally:
         if device is not None:
             hdc(device, "shell", f"rm -rf {DEVICE_DIR}")
+
+
+def run_sanitizer_tests(args, entry, clang_dir: Path, c: Checker, work: Path, device: str, sysroot: Path):
+    """Each tests/sanitizers/<sanitizer>-*.c has to make the sanitizer print every
+    `ohos-expect:` line on the device, with the toolchain's shared runtime pushed
+    alongside. Only for toolchains whose manifest entry lists the sanitizer."""
+    triple = args.device_target
+    resource_dirs = sorted((clang_dir / "lib" / "clang").iterdir())
+    c.check("exactly one clang resource directory", len(resource_dirs) == 1, str(resource_dirs))
+    for src in sorted(SANITIZER_TESTS_DIR.glob("*.c")):
+        sanitizer = src.stem.split("-")[0]
+        if sanitizer not in entry.get("sanitizers", []):
+            continue
+        runtime = resource_dirs[0] / "lib" / triple / f"libclang_rt.{SANITIZER_RUNTIMES[sanitizer]}.so"
+        if not runtime.is_file():
+            print(f"note: no {sanitizer} runtime for {triple}, skipping {src.name}")
+            continue
+        expected = [line.split("ohos-expect:", 1)[1].strip()
+                    for line in src.read_text().splitlines()[:10] if "ohos-expect:" in line]
+        flags = [f"-fsanitize={sanitizer}", "-shared-libsan", "-g"]
+        if sanitizer == "thread":
+            # The OpenHarmony TSan runtime dies at startup unless a libc++ is loaded
+            # (see cargo-ohos); every OpenHarmony system ships this one.
+            libcxx_shared = Path(args.ohos_sdk_native) / "llvm" / "lib" / triple / "libc++_shared.so"
+            flags += ["-Wl,--no-as-needed", str(libcxx_shared), "-Wl,--as-needed"]
+        out = work / f"{src.stem}-{triple}"
+        p = c.run(f"{src.name}: compile+link ({triple})", [
+            str(tool(clang_dir, args.host, "clang")), f"--target={triple}", f"--sysroot={sysroot}",
+            "-fuse-ld=lld", *flags, str(src), "-o", str(out),
+        ])
+        if p.returncode != 0:
+            continue
+        ok, text = device_run(device, out, expected[0], runtime, require_success=False)
+        c.check(f"{src.name}: {sanitizer} sanitizer reports on device",
+                ok and all(line in text for line in expected), text)
 
 
 def cmd_fetch(args):
@@ -362,6 +418,7 @@ def main():
     v.add_argument("--full", action="store_true", help="compile/link/run smoke tests against an OHOS sysroot")
     v.add_argument("--write-abi", action="store_true", help="(re)generate abi/<version>/*.syms instead of diffing")
     v.add_argument("--work", help="reuse DIR for downloads/extraction (default: mktemp)")
+    v.add_argument("--archive", help="the archive of a toolchain built from source")
     v.add_argument("--device", nargs="?", const="", default=None, metavar="CONNECT_KEY",
                    help="also run smoke tests on a device/emulator via hdc "
                         "(optional hdc connect-key; bare flag = sole connected target)")

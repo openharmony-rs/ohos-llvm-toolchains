@@ -13,7 +13,20 @@ permissions:
   attestations: write
 
 jobs:
+  kind:
+    runs-on: ubuntu-latest
+    outputs:
+      source: ${{ steps.kind.outputs.source }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: kind
+        env:
+          VERSION: ${{ inputs.version }}
+        run: echo "source=$(jq --arg v "$VERSION" '.toolchains[$v] | has("source")' toolchains.json)" >> "$GITHUB_OUTPUT"
+
   mirror:
+    needs: kind
+    if: needs.kind.outputs.source == 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -42,5 +55,51 @@ jobs:
           the libc++ flavor notes."
           gh release create "toolchain-$V" \
             --title "OpenHarmony LLVM toolchain $V (mirror)" \
+            --notes "$NOTES" \
+            dist/*
+
+  build:
+    needs: kind
+    if: needs.kind.outputs.source == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ inputs.version }}
+
+  # Attested here rather than in build.yml, so that the signer is this workflow for every
+  # release, which is what cargo-ohos verifies.
+  publish-build:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: toolchain-${{ inputs.version }}
+          path: dist
+      # Provenance: attests that these bytes were built by this repository's build
+      # workflow from the pinned fork commit and patches, and passed its validation.
+      - name: Attest artifacts
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ inputs.version }}
+        run: |
+          commit=$(jq -r --arg v "$V" '.toolchains[$v].source.commit' toolchains.json)
+          repository=$(jq -r --arg v "$V" '.toolchains[$v].source.repository' toolchains.json)
+          patches=$(jq -r --arg v "$V" '.toolchains[$v].source.patches | map("- `" + . + "`") | join("\n")' toolchains.json)
+          NOTES="OpenHarmony LLVM toolchain \`$V\`, built from source by this repository: \
+          the OpenHarmony LLVM fork ${repository%.git} at \`$commit\`, plus these patches \
+          from \`patches/$V/\`, which are not part of the fork:
+
+          $patches
+
+          Linux x86_64 host only. See README.md for what the build includes."
+          gh release create "toolchain-$V" \
+            --title "OpenHarmony LLVM toolchain $V (built from source)" \
             --notes "$NOTES" \
             dist/*

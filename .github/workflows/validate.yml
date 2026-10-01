@@ -18,7 +18,8 @@ jobs:
       - uses: actions/checkout@v7
       - id: list
         run: |
-          echo "versions=$(python3 -c "import json; print(json.dumps(sorted(json.load(open('toolchains.json'))['toolchains'])))")" >> "$GITHUB_OUTPUT"
+          # Toolchains built from source are validated by build.yml.
+          echo "versions=$(jq -c '[.toolchains | to_entries[] | select(.value.source | not) | .key] | sort' toolchains.json)" >> "$GITHUB_OUTPUT"
 
   linux:
     needs: plan

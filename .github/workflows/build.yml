@@ -1,0 +1,179 @@
+name: Build toolchain from source
+
+on:
+  pull_request:
+    paths:
+      - scripts/build_toolchain.py
+      - scripts/ohos_toolchain.py
+      - patches/**
+      - tests/**
+      - toolchains.json
+      - abi/**
+      - .github/workflows/build.yml
+  # Called by the Mirror release workflow, which attests and publishes the archive.
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Toolchain version key from toolchains.json (default: every source-built one)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.list.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: list
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            versions=$(jq -c --arg v "$VERSION" '[.toolchains[$v] | select(.source) | $v]' toolchains.json)
+          else
+            versions=$(jq -c '[.toolchains | to_entries[] | select(.value.source) | .key]' toolchains.json)
+          fi
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+  host:
+    needs: plan
+    if: needs.plan.outputs.versions != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    runs-on: ubuntu-latest
+    # glibc 2.28, so that the host tools run on the Linux distributions of the last years,
+    # like the OpenHarmony project's own prebuilts.
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    env:
+      VERSION: ${{ matrix.version }}
+      CC: gcc
+      CXX: g++
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build tools
+        run: |
+          echo /opt/python/cp312-cp312/bin >> "$GITHUB_PATH"
+          /opt/python/cp312-cp312/bin/pip install cmake ninja
+      - name: Fetch the source and apply the patches
+        run: python3 scripts/build_toolchain.py source "$VERSION" build/src
+      - name: Build clang, lld and the LLVM tools
+        run: |
+          linker=()
+          if command -v ld.gold > /dev/null; then linker=(--linker gold); fi
+          python3 scripts/build_toolchain.py host "$VERSION" build/src build/work "${linker[@]}"
+      - name: Check the glibc requirement
+        run: |
+          newest=$(objdump -T build/work/install/bin/* build/work/install/lib/libclang.so* 2> /dev/null \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+          echo "newest glibc symbol version: $newest"
+          [ "$(printf '%s\n' "$newest" GLIBC_2.28 | sort -V | tail -1)" = GLIBC_2.28 ]
+      - name: Pack
+        run: tar -C build/work -czf host-install.tar.gz install
+      - uses: actions/upload-artifact@v7
+        with:
+          name: host-${{ matrix.version }}
+          path: host-install.tar.gz
+          retention-days: 7
+
+  targets:
+    needs: [plan, host]
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@v7
+      # The sysroot the target runtimes are built against. API 20, like the validation.
+      - name: Setup OpenHarmony SDK
+        id: sdk
+        uses: openharmony-rs/setup-ohos-sdk@v1.0
+        with:
+          version: "6.0"
+          components: "native"
+          mirror: true
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - uses: actions/download-artifact@v8
+        with:
+          name: host-${{ matrix.version }}
+      - name: Unpack the host tools
+        run: mkdir -p build/work && tar -C build/work -xzf host-install.tar.gz
+      - name: Fetch the source and apply the patches
+        run: scripts/build_toolchain.py source "$VERSION" build/src
+      - name: Build compiler-rt and libc++ for the targets
+        env:
+          OHOS_SDK_NATIVE: ${{ steps.sdk.outputs.ohos_sdk_native }}
+        run: |
+          read -ra targets < <(jq -r --arg v "$VERSION" '.toolchains[$v].targets | join(" ")' toolchains.json)
+          scripts/build_toolchain.py target "$VERSION" build/src build/work "${targets[@]}"
+      - name: Package
+        run: scripts/build_toolchain.py package "$VERSION" build/src build/work dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: toolchain-${{ matrix.version }}
+          path: dist/
+          retention-days: 7
+
+  validate:
+    needs: [plan, targets]
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup OpenHarmony SDK (sysroot + hdc)
+        id: sdk
+        uses: openharmony-rs/setup-ohos-sdk@v1.0
+        with:
+          version: "6.0"
+          components: "native;toolchains"
+          mirror: true
+      - name: Add hdc to PATH
+        run: echo "${{ steps.sdk.outputs.sdk-path }}/linux/toolchains" >> "$GITHUB_PATH"
+      - name: Install qemu (aarch64 user-mode, for static smoke tests)
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Start Oniro emulator
+        id: emulator
+        uses: openharmony-rs/emulator-action@v1
+        with:
+          release: v6.0
+      - uses: actions/download-artifact@v8
+        with:
+          name: toolchain-${{ matrix.version }}
+          path: dist
+      - name: Validate (full; smoke and sanitizer tests under qemu and on the emulator)
+        env:
+          OHOS_SDK_NATIVE: ${{ steps.sdk.outputs.ohos_sdk_native }}
+        run: |
+          archive=dist/$(jq -r --arg v "$VERSION" '.toolchains[$v].hosts["linux-x86_64"].clang.file' toolchains.json)
+          scripts/ohos_toolchain.py validate "$VERSION" linux-x86_64 --archive "$archive" --full --device
+      - name: Upload emulator log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: oniro-emulator-log-${{ matrix.version }}
+          path: ${{ steps.emulator.outputs.log-path }}
+          if-no-files-found: warn

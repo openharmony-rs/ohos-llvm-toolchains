@@ -21,11 +21,15 @@ archives stay on the mirror. This repository:
 - **mirrors** them into GitHub releases of this repository, so consumers
   don't depend on the upstream mirror's retention policy.
 
+Where no prebuilt is good enough, it also **builds** a toolchain from the fork's
+source, see [Toolchains built from source](#toolchains-built-from-source).
+
 ## Pinned toolchains
 
 | Version | LLVM | Status | Hosts | OHOS targets |
 |---|---|---|---|---|
 | `19.1.4-79830f` | 19.1.4 (2026‑02‑23) | preview | linux‑x86_64, darwin‑arm64, darwin‑x86_64, windows‑x86_64 | aarch64, arm, x86_64 |
+| `21.1.8-7fda98` | 21.1.8 (2026‑09‑17) | built from source, patched | linux‑x86_64 | aarch64, arm, x86_64 |
 
 Archives per host: `clang_*` (the toolchain: host clang/lld/llvm-* plus
 OHOS-target runtimes and full libc++ headers) and `libcxx-ndk_*` (see below).
@@ -75,16 +79,74 @@ Notes:
 2. The sysroot still comes from a regular OpenHarmony SDK; only the
    `llvm/` part is replaced by this toolchain.
 
-`cargo-ohos` integration (an external-toolchain mode building on its
-inline-flags support) is planned; until then the env can be assembled
-manually as above.
+[cargo-ohos](https://github.com/openharmony-rs/cargo-ohos) downloads,
+verifies and uses a release of this repository with
+`--download-prebuilt <version>` (e.g. `--download-prebuilt=21`).
 
+
+## Toolchains built from source
+
+Entries with a `source` object in `toolchains.json` are not mirrored but built
+by [`scripts/build_toolchain.py`](scripts/build_toolchain.py) from the fork at
+the pinned commit. The reason is the sanitizers: no published prebuilt has
+AddressSanitizer and ThreadSanitizer runtimes that work on OpenHarmony (19.1.4's
+reference Android's `__errno` and place ASan's allocator outside a 39-bit
+address space; the fixes, and the ThreadSanitizer report fixes of 2026-08-24,
+are only on the fork's branches).
+
+The build is reduced to what [cargo-ohos](https://github.com/openharmony-rs/cargo-ohos)
+uses, in the layout of the fork's prebuilts:
+
+- clang, lld, the LLVM binutils (`llvm-ar`, `llvm-objcopy`, `llvm-readelf`,
+  ...) and `libclang`, for a **linux-x86_64** host only, built in a
+  `manylinux_2_28` container so that they need glibc 2.28 at most;
+- per target (`aarch64`, `arm` with the default soft-float multilib only,
+  `x86_64`): compiler-rt (builtins, crt objects, ASan, TSan, UBSan) and the
+  toolchain flavour of libc++ (`__h`), built against the sysroot of the
+  OpenHarmony 6.0 (API 20) SDK.
+
+Not included, unlike the fork's prebuilts: the ndk libc++ flavour, lldb,
+clang-tools-extra, OpenMP, the other `arm` multilibs, and gwp_asan (which
+needs OpenHarmony's platform sysroot). There is no LTO or PGO, so the
+compiler itself is somewhat slower.
+
+### Patches
+
+`patches/<version>/` holds the changes applied on top of the fork, listed
+under `source.patches`. They are **not part of the OpenHarmony LLVM fork**:
+each says so in its message, the release notes list them, and the archive
+carries them in `llvm/patches/` next to a `BUILD_INFO.json` naming the fork
+commit. A patch belongs upstream; it stays here only until the fork has it.
+
+- `21.1.8-7fda98/0001`: ThreadSanitizer restores all of its signal-handler
+  state when a handler `longjmp`s out. Without it, the first report on a
+  device without SHA-512 instructions corrupts the shadow stack (OpenSSL's
+  CPU feature probe in the reporting path does exactly that) and the process
+  crashes after the report.
+
+### Building one locally
+
+```sh
+V=21.1.8-7fda98
+scripts/build_toolchain.py source "$V" build/src
+scripts/build_toolchain.py host "$V" build/src build/work --linker lld
+OHOS_SDK_NATIVE=<sdk>/native scripts/build_toolchain.py target "$V" build/src build/work \
+  aarch64-linux-ohos arm-linux-ohos x86_64-linux-ohos
+scripts/build_toolchain.py package "$V" build/src build/work dist
+scripts/ohos_toolchain.py validate "$V" linux-x86_64 --archive dist/clang_*.tar.gz --full --device
+```
+
+The host stage takes about 3 CPU-hours (8 minutes on 32 cores), the target
+stage a few CPU-minutes. CI builds and validates every source-built version on
+pull requests that touch the build (`build.yml`), and again in the *Mirror
+release* workflow before publishing.
 
 ## Adding or bumping a toolchain version
 
 1. Add the entry to `toolchains.json` (copy the sha256 values from the
    mirror's `.sha256` files — do not compute them from your own download
-   alone).
+   alone). For a toolchain built from source, give the fork commit and
+   patches under `source` instead, and only the archive name per host.
 2. Generate ABI snapshots: `scripts/ohos_toolchain.py validate <version>
    <host> --write-abi` on a matching host, and commit `abi/<version>/`.
 3. Open a PR; CI validates every host.
@@ -96,6 +158,7 @@ manually as above.
 ## License
 
 The scripts and configuration in this repository are licensed under MIT OR Apache-2.0. 
-The mirrored toolchain archives are built from the OpenHarmony LLVM fork of the LLVM
-project and retain their own license (Apache-2.0 WITH LLVM-exception);
-this repository redistributes them unmodified.
+The toolchain archives are built from the OpenHarmony LLVM fork of the LLVM
+project and retain their own license (Apache-2.0 WITH LLVM-exception).
+Mirrored archives are redistributed unmodified; the ones built from source
+here contain the patches in `patches/`.

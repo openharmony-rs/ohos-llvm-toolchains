@@ -19,6 +19,7 @@ Stdlib only; external tools used: hdc/qemu when requested.
 import argparse
 import ctypes
 import hashlib
+import http.client
 import json
 import platform
 import shutil
@@ -76,21 +77,27 @@ def sha256_file(path: Path) -> str:
 
 def download(url: str, dest: Path):
     part = dest.with_suffix(dest.suffix + ".part")
-    for attempt in range(3):
+    attempts = 5
+    for attempt in range(attempts):
         try:
             print(f"== downloading {url}")
             # repo.huaweicloud.com answers urllib's default User-Agent with 403.
             request = urllib.request.Request(url, headers={"User-Agent": "ohos-llvm-toolchains"})
             with urllib.request.urlopen(request) as r, part.open("wb") as f:
                 shutil.copyfileobj(r, f)
+                length = r.headers.get("Content-Length")
+            # urllib ends the body quietly, without an error, when the connection drops.
+            size = part.stat().st_size
+            if length is not None and size != int(length):
+                raise OSError(f"the connection ended after {size} of {length} bytes")
             part.rename(dest)
             return
-        except OSError as e:
+        except (OSError, http.client.HTTPException) as e:
             part.unlink(missing_ok=True)
-            if attempt == 2:
+            if attempt == attempts - 1:
                 raise
             print(f"   retrying after error: {e}")
-            time.sleep(5)
+            time.sleep(10 * (attempt + 1))
 
 
 def fetch_archive(work: Path, base: str, version: str, host_dir: str, entry: dict) -> Path:
@@ -101,7 +108,7 @@ def fetch_archive(work: Path, base: str, version: str, host_dir: str, entry: dic
     got = sha256_file(dest)
     if got != entry["sha256"]:
         sys.exit(
-            f"error: sha256 mismatch for {entry['file']}\n"
+            f"error: sha256 mismatch for {entry['file']} ({dest.stat().st_size} bytes)\n"
             f"  expected: {entry['sha256']}\n  got:      {got}"
         )
     print(f"== sha256 OK: {entry['file']}")

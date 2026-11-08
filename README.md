@@ -84,6 +84,24 @@ Notes:
 verifies and uses a release of this repository with
 `--download-prebuilt <version>` (e.g. `--download-prebuilt=21`).
 
+### Verifying a download
+
+Every archive of a release, and its `SHA256SUMS`, has a build provenance
+attestation from the *Mirror release* workflow on `main`, which cargo-ohos
+checks before it uses a download. To check one yourself:
+
+```sh
+gh attestation verify clang_linux-x86_64-7fda98-20260917.tar.gz \
+  --repo openharmony-rs/ohos-llvm-toolchains \
+  --signer-workflow openharmony-rs/ohos-llvm-toolchains/.github/workflows/mirror.yml \
+  --source-ref refs/heads/main
+```
+
+For a mirrored toolchain, it attests that these are the bytes pinned here,
+which passed the validation, not how the OpenHarmony project built them; for
+one built from source, that this repository's workflows built them from the
+pinned fork commit and patches, and validated them.
+
 
 ## Toolchains built from source
 

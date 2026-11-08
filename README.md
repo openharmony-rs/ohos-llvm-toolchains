@@ -32,6 +32,10 @@ source, see [Toolchains built from source](#toolchains-built-from-source).
 | `19.1.4-79830f` | 19.1.4 (2026‑02‑23) | preview | linux‑x86_64, darwin‑arm64, darwin‑x86_64, windows‑x86_64 | aarch64, arm, x86_64 |
 | `21.1.8-7fda98` | 21.1.8 (2026‑09‑17) | built from source, patched | linux‑x86_64, darwin‑arm64, windows‑x86_64 | aarch64, arm, x86_64 |
 
+The Linux `lld` of `19.1.4-79830f` needs `libxml2.so.2`, which distributions
+with libxml2 2.14 or newer, such as Ubuntu 26.04, no longer have; CI validates
+it on Ubuntu 24.04. The toolchains built from source need no libxml2.
+
 Archives per host: `clang_*` (the toolchain: host clang/lld/llvm-* plus
 OHOS-target runtimes and full libc++ headers) and `libcxx-ndk_*` (see below).
 

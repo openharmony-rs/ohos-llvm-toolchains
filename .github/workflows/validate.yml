@@ -23,7 +23,8 @@ jobs:
 
   linux:
     needs: plan
-    runs-on: ubuntu-latest
+    # The mirrored prebuilts' lld needs libxml2.so.2, which Ubuntu 26.04 no longer has.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:

@@ -68,7 +68,9 @@ def download(url: str, dest: Path):
     for attempt in range(3):
         try:
             print(f"== downloading {url}")
-            with urllib.request.urlopen(url) as r, part.open("wb") as f:
+            # repo.huaweicloud.com answers urllib's default User-Agent with 403.
+            request = urllib.request.Request(url, headers={"User-Agent": "ohos-llvm-toolchains"})
+            with urllib.request.urlopen(request) as r, part.open("wb") as f:
                 shutil.copyfileobj(r, f)
             part.rename(dest)
             return

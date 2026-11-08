@@ -17,7 +17,8 @@ archives stay on the mirror. This repository:
 - **validates** them in CI (checksums, layout, libc++ ABI namespace, an
   exported-symbol ABI snapshot, and compile/link/run smoke tests against a
   real OHOS sysroot — executed both under qemu-user and on a booted
-  OpenHarmony system, the [Oniro emulator](https://github.com/eclipse-oniro4openharmony/device_board_oniro)),
+  OpenHarmony system, the [Oniro emulator](https://github.com/eclipse-oniro4openharmony/device_board_oniro) —
+  and libclang parsing them the way bindgen does),
 - **mirrors** them into GitHub releases of this repository, so consumers
   don't depend on the upstream mirror's retention policy.
 
@@ -168,7 +169,8 @@ stage a few CPU-minutes. CI builds and validates every source-built version on
 pull requests that touch the build (`build.yml`), and again in the *Mirror
 release* workflow before publishing: the Linux archive with the full
 validation, including on the Oniro emulator, the others on their own systems,
-where their tools have to compile and link the tests.
+where their tools have to compile and link the tests for every target, and
+their libclang has to parse them the way bindgen does.
 
 ## Adding or bumping a toolchain version
 

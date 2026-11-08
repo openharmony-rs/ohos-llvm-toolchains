@@ -7,15 +7,17 @@ Subcommands:
 
 Validation covers: archive checksums, toolchain layout, libc++ ABI namespaces
 and version, an exported-symbol ABI snapshot (removals break shipped apps),
-and with --full compile/link/run smoke tests against an OHOS sysroot — under
-qemu-user (aarch64, static) and, with --device, on a real OpenHarmony system
-(e.g. the Oniro emulator) via hdc, including dynamic loading of the
-toolchain's own libc++.so.
+and with --full compile/link/run smoke tests against an OHOS sysroot for every
+target — under qemu-user (aarch64, static) and, with --device, on a
+real OpenHarmony system (e.g. the Oniro emulator) via hdc, including dynamic
+loading of the toolchain's own libc++.so — and libclang parsing them like
+bindgen does.
 
 Stdlib only; external tools used: hdc/qemu when requested.
 """
 
 import argparse
+import ctypes
 import hashlib
 import json
 import platform
@@ -35,6 +37,12 @@ TESTS_DIR = REPO_ROOT / "tests"
 SANITIZER_TESTS_DIR = TESTS_DIR / "sanitizers"
 SANITIZER_RUNTIMES = {"address": "asan", "thread": "tsan"}
 DEVICE_DIR = "/data/local/tmp/ohos-llvm-validate"
+# Not arm: static armv7 binaries die with SIGILL in the SDK's own startup code (the
+# stack protector of __init_libc), with the SDK's clang too, under qemu and on devices.
+QEMU_ARCHES = {"aarch64-linux-ohos": "aarch64"}
+# What cargo-ohos passes for armv7-unknown-linux-ohos; the bare triple is not ARMv7.
+TARGET_FLAGS = {"arm-linux-ohos": ["-march=armv7-a", "-mfloat-abi=softfp", "-mtune=generic-armv7-a", "-mthumb"]}
+LIBCLANG = {"linux": "lib/libclang.so", "darwin": "lib/libclang.dylib", "windows": "bin/libclang.dll"}
 
 
 def discover_tests() -> list[tuple[Path, list[str]]]:
@@ -292,16 +300,18 @@ def run_full(args, entry, clang_dir: Path, c: Checker, work: Path):
         kind = "static" if static else "shared"
         out = work / f"{src.stem}-{triple}-{kind}"
         cmd = [
-            str(compiler_for(src)), f"--target={triple}", f"--sysroot={sysroot}",
-            "-fuse-ld=lld", *flags, *(["-static"] if static else []),
+            str(compiler_for(src)), f"--target={triple}", *TARGET_FLAGS.get(triple, []),
+            f"--sysroot={sysroot}", "-fuse-ld=lld", *flags, *(["-static"] if static else []),
             str(src), "-o", str(out),
         ]
         p = c.run(f"{src.name}: compile+link ({triple}, {kind})", cmd)
         return out if p.returncode == 0 else None
 
-    qemu = shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")
-    if not qemu:
-        print("note: qemu-aarch64 not available, skipping qemu execution tests")
+    qemus = {}
+    for triple, arch in QEMU_ARCHES.items():
+        qemus[triple] = shutil.which(f"qemu-{arch}-static") or shutil.which(f"qemu-{arch}")
+        if not qemus[triple]:
+            print(f"note: qemu-{arch} not available, skipping the {triple} qemu execution tests")
 
     device = args.device
     if device is not None:
@@ -311,41 +321,104 @@ def run_full(args, entry, clang_dir: Path, c: Checker, work: Path):
     else:
         print("note: no --device, skipping on-device execution tests")
 
+    triples = list(dict.fromkeys(entry["targets"] + ([args.device_target] if device is not None else [])))
     try:
         for src, flags in tests:
             marker = f"{src.stem}-ok"
-            # Primary target: aarch64. Static binaries run under qemu-user.
-            a64_static = build(src, flags, "aarch64-linux-ohos", static=True)
-            a64_shared = build(src, flags, "aarch64-linux-ohos", static=False)
-            if qemu and a64_static:
-                p = subprocess.run([qemu, str(a64_static)], capture_output=True, text=True)
-                c.check(
-                    f"{src.name}: static aarch64 binary runs under qemu",
-                    p.returncode == 0 and marker in p.stdout,
-                    (p.stdout + p.stderr).strip(),
-                )
-            # Device / emulator: real OpenHarmony userland. The shared run is
-            # the only place the dynamic-loader path (toolchain libc++.so
-            # bundled, correct flavor) gets tested.
-            if device is None:
-                continue
-            triple = args.device_target
-            if triple == "aarch64-linux-ohos":
-                dev_static, dev_shared = a64_static, a64_shared
-            else:
-                dev_static = build(src, flags, triple, static=True)
-                dev_shared = build(src, flags, triple, static=False)
-            if dev_static:
-                ok, out = device_run(device, dev_static, marker)
-                c.check(f"{src.name}: static binary runs on device", ok, out)
-            if dev_shared:
-                lib = clang_dir / "lib" / triple / "libc++.so" if src.suffix == ".cpp" else None
-                ok, out = device_run(device, dev_shared, marker, lib)
-                c.check(f"{src.name}: shared binary runs on device", ok, out)
+            for triple in triples:
+                static = build(src, flags, triple, static=True)
+                shared = build(src, flags, triple, static=False)
+                if qemus.get(triple) and static:
+                    p = subprocess.run([qemus[triple], str(static)], capture_output=True, text=True)
+                    c.check(
+                        f"{src.name}: static {triple} binary runs under qemu",
+                        p.returncode == 0 and marker in p.stdout,
+                        (p.stdout + p.stderr).strip(),
+                    )
+                # Device / emulator: real OpenHarmony userland. The shared run is
+                # the only place the dynamic-loader path (toolchain libc++.so
+                # bundled, correct flavor) gets tested.
+                if device is None or triple != args.device_target:
+                    continue
+                if static:
+                    ok, out = device_run(device, static, marker)
+                    c.check(f"{src.name}: static binary runs on device", ok, out)
+                if shared:
+                    lib = clang_dir / "lib" / triple / "libc++.so" if src.suffix == ".cpp" else None
+                    ok, out = device_run(device, shared, marker, lib)
+                    c.check(f"{src.name}: shared binary runs on device", ok, out)
+        for triple in entry["targets"]:
+            run_libclang_test(args, clang_dir, c, sysroot, triple)
         run_sanitizer_tests(args, entry, clang_dir, c, work, device, sysroot)
     finally:
         if device is not None:
             hdc(device, "shell", f"rm -rf {DEVICE_DIR}")
+
+
+class CXString(ctypes.Structure):
+    _fields_ = [("data", ctypes.c_void_p), ("private_flags", ctypes.c_uint)]
+
+
+def load_libclang(path: Path) -> ctypes.CDLL:
+    lib = ctypes.CDLL(str(path))
+    signatures = {
+        "clang_getCString": (ctypes.c_char_p, [CXString]),
+        "clang_disposeString": (None, [CXString]),
+        "clang_createIndex": (ctypes.c_void_p, [ctypes.c_int, ctypes.c_int]),
+        "clang_disposeIndex": (None, [ctypes.c_void_p]),
+        "clang_parseTranslationUnit": (ctypes.c_void_p, [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]),
+        "clang_disposeTranslationUnit": (None, [ctypes.c_void_p]),
+        "clang_getNumDiagnostics": (ctypes.c_uint, [ctypes.c_void_p]),
+        "clang_getDiagnostic": (ctypes.c_void_p, [ctypes.c_void_p, ctypes.c_uint]),
+        "clang_getDiagnosticSeverity": (ctypes.c_int, [ctypes.c_void_p]),
+        "clang_formatDiagnostic": (CXString, [ctypes.c_void_p, ctypes.c_uint]),
+    }
+    for name, (restype, argtypes) in signatures.items():
+        getattr(lib, name).restype = restype
+        getattr(lib, name).argtypes = argtypes
+    return lib
+
+
+def run_libclang_test(args, clang_dir: Path, c: Checker, sysroot: Path, triple: str):
+    """libclang the way bindgen uses it under cargo-ohos: the system include
+    directories of the toolchain's clang++ (bindgen asks the CLANG_PATH compiler,
+    which cargo-ohos sets to it) as -isystem, then the C++ tests parsed through
+    the C API by this process."""
+    lib = load_libclang(clang_dir / LIBCLANG[args.host.split("-")[0]])
+    target_args = [f"--target={triple}", *TARGET_FLAGS.get(triple, []), f"--sysroot={sysroot}"]
+    for src, flags in discover_tests():
+        if src.suffix != ".cpp":
+            continue
+        p = subprocess.run([str(tool(clang_dir, args.host, "clang++")), "-E", "-x", "c++", *target_args,
+                            *flags, "-", "-v"], input="", capture_output=True, text=True)
+        lines = p.stderr.splitlines()
+        try:
+            include_dirs = lines[lines.index("#include <...> search starts here:") + 1:
+                                 lines.index("End of search list.")]
+        except ValueError:
+            c.check(f"{src.name}: clang++ lists its {triple} include directories", False, p.stderr.strip())
+            continue
+        clang_args = target_args + flags
+        for include_dir in include_dirs:
+            clang_args += ["-isystem", include_dir.strip()]
+        index = lib.clang_createIndex(0, 0)
+        argv = (ctypes.c_char_p * len(clang_args))(*[a.encode() for a in clang_args])
+        unit = lib.clang_parseTranslationUnit(index, str(src).encode(), argv, len(argv), None, 0, 0)
+        errors = []
+        for i in range(lib.clang_getNumDiagnostics(unit) if unit else 0):
+            diagnostic = lib.clang_getDiagnostic(unit, i)
+            # 3 and 4: CXDiagnostic_Error and CXDiagnostic_Fatal.
+            if lib.clang_getDiagnosticSeverity(diagnostic) >= 3:
+                text = lib.clang_formatDiagnostic(diagnostic, 0)
+                errors.append(lib.clang_getCString(text).decode())
+                lib.clang_disposeString(text)
+        c.check(f"{src.name}: libclang parses it for {triple}", unit is not None and not errors,
+                "\n".join(errors[:5]) if unit else "clang_parseTranslationUnit failed")
+        if unit:
+            lib.clang_disposeTranslationUnit(unit)
+        lib.clang_disposeIndex(index)
 
 
 def run_sanitizer_tests(args, entry, clang_dir: Path, c: Checker, work: Path, device: str | None,
@@ -375,7 +448,8 @@ def run_sanitizer_tests(args, entry, clang_dir: Path, c: Checker, work: Path, de
             flags += ["-Wl,--no-as-needed", str(libcxx_shared), "-Wl,--as-needed"]
         out = work / f"{src.stem}-{triple}"
         p = c.run(f"{src.name}: compile+link ({triple})", [
-            str(tool(clang_dir, args.host, "clang")), f"--target={triple}", f"--sysroot={sysroot}",
+            str(tool(clang_dir, args.host, "clang")), f"--target={triple}", *TARGET_FLAGS.get(triple, []),
+            f"--sysroot={sysroot}",
             "-fuse-ld=lld", *flags, str(src), "-o", str(out),
         ])
         if p.returncode != 0 or device is None:

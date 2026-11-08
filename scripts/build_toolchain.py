@@ -219,6 +219,12 @@ def target_defines(src: Path, work: Path, triple: str, sysroot: Path) -> dict:
     # The llvm-build copy, unlike the SDK's, disables versioned sonames, which
     # OpenHarmony's loader does not resolve.
     shutil.copy(src / "llvm-build" / "OHOS.cmake", platform / "Platform" / "OHOS.cmake")
+    # CMake 4 has its own Platform/OHOS.cmake, which is just Linux's and which it
+    # prefers to ours, so its settings are applied again after the platform's.
+    overrides = platform / "OHOSOverrides.cmake"
+    overrides.write_text("set(CMAKE_PLATFORM_NO_VERSIONED_SONAME 1)\n"
+                         "set(CMAKE_SHARED_LIBRARY_RUNTIME_C_FLAG \"\")\n"
+                         "set(CMAKE_SHARED_LIBRARY_RUNTIME_CXX_FLAG \"\")\n")
     cflags = [
         f"--target={triple}",
         "-D__MUSL__",
@@ -243,6 +249,7 @@ def target_defines(src: Path, work: Path, triple: str, sysroot: Path) -> dict:
         "CMAKE_SYSTEM_NAME": "OHOS",
         "CMAKE_CROSSCOMPILING": "True",
         "CMAKE_MODULE_PATH": platform,
+        "CMAKE_USER_MAKE_RULES_OVERRIDE": overrides,
         "CMAKE_SYSROOT": sysroot,
         "CMAKE_FIND_ROOT_PATH_MODE_PROGRAM": "NEVER",
         "CMAKE_C_COMPILER": install / "bin" / "clang",
@@ -373,8 +380,12 @@ def package_files(host: str, install: Path, host_install: Path) -> dict[Path, Pa
             sys.exit(f"error: {rel} of the {host} host install is not in {install}, or differs")
     for path in sorted(install.rglob("*")):
         rel = path.relative_to(install)
-        if not host_specific(rel):
-            files[rel] = path
+        if host_specific(rel):
+            continue
+        if path.is_symlink():
+            sys.exit(f"error: {rel} is a symbolic link: the target runtimes need unversioned "
+                     "sonames, and Windows cannot unpack symbolic links")
+        files[rel] = path
     return files
 
 

@@ -98,7 +98,8 @@ jobs:
 
           $patches
 
-          Linux x86_64 host only. See README.md for what the build includes."
+          For Linux x86_64, macOS arm64 and Windows x86_64 hosts. \
+          See README.md for what the build includes."
           gh release create "toolchain-$V" \
             --title "OpenHarmony LLVM toolchain $V (built from source)" \
             --notes "$NOTES" \

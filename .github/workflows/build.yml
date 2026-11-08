@@ -10,7 +10,7 @@ on:
       - toolchains.json
       - abi/**
       - .github/workflows/build.yml
-  # Called by the Mirror release workflow, which attests and publishes the archive.
+  # Called by the Mirror release workflow, which attests and publishes the archives.
   workflow_call:
     inputs:
       version:
@@ -24,6 +24,11 @@ on:
 
 permissions:
   contents: read
+
+env:
+  # The cross toolchain the windows-x86_64 host is built with.
+  LLVM_MINGW_RELEASE: "20261020"
+  LLVM_MINGW_SHA256: 55064b60b991a1e1e8090b8c2f84e82b22cfe5903d12c159d65064cf5e8ae335
 
 jobs:
   plan:
@@ -43,7 +48,7 @@ jobs:
           fi
           echo "versions=$versions" >> "$GITHUB_OUTPUT"
 
-  host:
+  host-linux:
     needs: plan
     if: needs.plan.outputs.versions != '[]'
     strategy:
@@ -81,12 +86,104 @@ jobs:
         run: tar -C build/work -czf host-install.tar.gz install
       - uses: actions/upload-artifact@v7
         with:
-          name: host-${{ matrix.version }}
+          name: host-${{ matrix.version }}-linux-x86_64
           path: host-install.tar.gz
           retention-days: 7
 
+  host-macos:
+    needs: plan
+    if: needs.plan.outputs.versions != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    runs-on: macos-15
+    env:
+      VERSION: ${{ matrix.version }}
+      HOST: darwin-arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install build tools
+        run: brew install ninja
+      - name: Fetch the source and apply the patches
+        run: python scripts/build_toolchain.py source "$VERSION" build/src
+      - name: Build clang, lld and the LLVM tools
+        run: python scripts/build_toolchain.py host "$VERSION" build/src build/work --host "$HOST"
+      # Nothing from Homebrew, and the minimum macOS version the script sets.
+      - name: Check the libraries and the minimum macOS version
+        run: |
+          cd build/work/install
+          libs=$(for f in bin/* lib/libclang.dylib; do [ -L "$f" ] || otool -L "$f" | tail -n +2; done \
+            | awk '{print $1}' | sort -u)
+          echo "$libs"
+          if grep -vE '^(/usr/lib/|/System/Library/|@rpath/libclang\.dylib$)' <<< "$libs"; then
+            echo "error: links libraries that are not part of macOS"
+            exit 1
+          fi
+          load_commands=$(otool -l bin/lld)
+          grep -A4 LC_BUILD_VERSION <<< "$load_commands" | grep -E 'minos 11\.0$'
+      - name: Pack
+        run: tar -C build/work -czf host-install.tar.gz install
+      - uses: actions/upload-artifact@v7
+        with:
+          name: host-${{ matrix.version }}-darwin-arm64
+          path: host-install.tar.gz
+          retention-days: 7
+
+  # Cross-compiled with llvm-mingw, like the fork's own Windows toolchains.
+  host-windows:
+    needs: plan
+    if: needs.plan.outputs.versions != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Install llvm-mingw
+        run: |
+          name=llvm-mingw-$LLVM_MINGW_RELEASE-ucrt-ubuntu-22.04-x86_64
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/llvm-mingw.tar.xz" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_RELEASE/$name.tar.xz"
+          echo "$LLVM_MINGW_SHA256  $RUNNER_TEMP/llvm-mingw.tar.xz" | sha256sum -c
+          mkdir "$RUNNER_TEMP/llvm-mingw"
+          tar -C "$RUNNER_TEMP/llvm-mingw" --strip-components=1 -xJf "$RUNNER_TEMP/llvm-mingw.tar.xz"
+      - name: Fetch the source and apply the patches
+        run: scripts/build_toolchain.py source "$VERSION" build/src
+      - name: Build clang, lld and the LLVM tools
+        run: |
+          scripts/build_toolchain.py host "$VERSION" build/src build/work --host windows-x86_64 \
+            --mingw "$RUNNER_TEMP/llvm-mingw"
+      # Linked statically: no DLL of llvm-mingw's (libc++, libunwind, winpthreads).
+      - name: Check the DLLs
+        run: |
+          cd build/work/install
+          dlls=$(for f in bin/*.exe bin/*.dll; do [ -L "$f" ] || "$RUNNER_TEMP/llvm-mingw/bin/llvm-readobj" --coff-imports "$f"; done \
+            | sed -n 's/^ *Name: //p' | sort -uf)
+          echo "$dlls"
+          if grep -viE '^(api-ms-win-crt-.*|kernel32|advapi32|ole32|oleaut32|shell32|user32|version|ws2_32|ntdll|psapi|dbghelp|bcrypt|libclang)\.dll$' <<< "$dlls"; then
+            echo "error: imports DLLs that are not part of Windows"
+            exit 1
+          fi
+      - name: Pack
+        run: tar -C build/work -czf host-install.tar.gz install
+      - uses: actions/upload-artifact@v7
+        with:
+          name: host-${{ matrix.version }}-windows-x86_64
+          path: host-install.tar.gz
+          retention-days: 7
+
+  # The target runtimes do not depend on the host, so they are built once.
   targets:
-    needs: [plan, host]
+    needs: [plan, host-linux]
     strategy:
       fail-fast: false
       matrix:
@@ -108,7 +205,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ninja-build
       - uses: actions/download-artifact@v8
         with:
-          name: host-${{ matrix.version }}
+          name: host-${{ matrix.version }}-linux-x86_64
       - name: Unpack the host tools
         run: mkdir -p build/work && tar -C build/work -xzf host-install.tar.gz
       - name: Fetch the source and apply the patches
@@ -119,16 +216,57 @@ jobs:
         run: |
           read -ra targets < <(jq -r --arg v "$VERSION" '.toolchains[$v].targets | join(" ")' toolchains.json)
           scripts/build_toolchain.py target "$VERSION" build/src build/work "${targets[@]}"
-      - name: Package
-        run: scripts/build_toolchain.py package "$VERSION" build/src build/work dist
+      - name: Pack
+        run: tar -C build/work -czf install.tar.gz install
+      - uses: actions/upload-artifact@v7
+        with:
+          name: targets-${{ matrix.version }}
+          path: install.tar.gz
+          retention-days: 7
+
+  package:
+    needs: [plan, targets, host-macos, host-windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: targets-${{ matrix.version }}
+          path: artifacts/targets-${{ matrix.version }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: host-${{ matrix.version }}-*
+          path: artifacts
+      - name: Fetch the source and apply the patches
+        run: scripts/build_toolchain.py source "$VERSION" build/src
+      - name: Package every host
+        run: |
+          mkdir -p build/work && tar -C build/work -xzf "artifacts/targets-$VERSION/install.tar.gz"
+          for host in $(jq -r --arg v "$VERSION" '.toolchains[$v].hosts | keys[]' toolchains.json); do
+            if [ "$host" = linux-x86_64 ]; then
+              scripts/build_toolchain.py package "$VERSION" build/src build/work dist
+            else
+              mkdir -p "build/host-$host"
+              tar -C "build/host-$host" -xzf "artifacts/host-$VERSION-$host/host-install.tar.gz"
+              scripts/build_toolchain.py package "$VERSION" build/src build/work dist \
+                --host "$host" --host-install "build/host-$host/install"
+            fi
+          done
+          cat dist/SHA256SUMS
       - uses: actions/upload-artifact@v7
         with:
           name: toolchain-${{ matrix.version }}
           path: dist/
           retention-days: 7
 
-  validate:
-    needs: [plan, targets]
+  validate-linux:
+    needs: [plan, package]
     strategy:
       fail-fast: false
       matrix:
@@ -177,3 +315,51 @@ jobs:
           name: oniro-emulator-log-${{ matrix.version }}
           path: ${{ steps.emulator.outputs.log-path }}
           if-no-files-found: warn
+
+  # The other hosts' tools on their own systems: they run, and compile and link the
+  # smoke and sanitizer tests. Running them is the Linux validation's job.
+  validate-other:
+    needs: [plan, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+        host: [darwin-arm64, windows-x86_64]
+        include:
+          - host: darwin-arm64
+            runner: macos-15
+          - host: windows-x86_64
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ matrix.version }}
+      HOST: ${{ matrix.host }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Setup OpenHarmony SDK (sysroot)
+        id: sdk
+        uses: openharmony-rs/setup-ohos-sdk@v1.0
+        with:
+          version: "6.0"
+          components: "native"
+          mirror: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: toolchain-${{ matrix.version }}
+          path: dist
+      - name: Validate (layout, ABI, and compiling and linking the tests)
+        env:
+          OHOS_SDK_NATIVE: ${{ steps.sdk.outputs.ohos_sdk_native }}
+        run: |
+          # The SDK action reports MSYS paths on Windows, which Python and clang do not take.
+          if command -v cygpath > /dev/null; then OHOS_SDK_NATIVE=$(cygpath -m "$OHOS_SDK_NATIVE"); fi
+          # -j: jq on Windows ends a line with a CR.
+          archive=dist/$(jq -j --arg v "$VERSION" --arg h "$HOST" '.toolchains[$v].hosts[$h].clang.file' toolchains.json)
+          python scripts/ohos_toolchain.py validate "$VERSION" "$HOST" --archive "$archive" --full \
+            --ohos-sdk-native "$OHOS_SDK_NATIVE"

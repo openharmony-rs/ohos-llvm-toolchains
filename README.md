@@ -29,7 +29,7 @@ source, see [Toolchains built from source](#toolchains-built-from-source).
 | Version | LLVM | Status | Hosts | OHOS targets |
 |---|---|---|---|---|
 | `19.1.4-79830f` | 19.1.4 (2026‑02‑23) | preview | linux‑x86_64, darwin‑arm64, darwin‑x86_64, windows‑x86_64 | aarch64, arm, x86_64 |
-| `21.1.8-7fda98` | 21.1.8 (2026‑09‑17) | built from source, patched | linux‑x86_64 | aarch64, arm, x86_64 |
+| `21.1.8-7fda98` | 21.1.8 (2026‑09‑17) | built from source, patched | linux‑x86_64, darwin‑arm64, windows‑x86_64 | aarch64, arm, x86_64 |
 
 Archives per host: `clang_*` (the toolchain: host clang/lld/llvm-* plus
 OHOS-target runtimes and full libc++ headers) and `libcxx-ndk_*` (see below).
@@ -98,12 +98,25 @@ The build is reduced to what [cargo-ohos](https://github.com/openharmony-rs/carg
 uses, in the layout of the fork's prebuilts:
 
 - clang, lld, the LLVM binutils (`llvm-ar`, `llvm-objcopy`, `llvm-readelf`,
-  ...) and `libclang`, for a **linux-x86_64** host only, built in a
-  `manylinux_2_28` container so that they need glibc 2.28 at most;
+  ...) and `libclang`, for these hosts:
+  - **linux-x86_64**, built in a `manylinux_2_28` container so that they need
+    glibc 2.28 at most;
+  - **darwin-arm64**, built on macOS 15, for macOS 11 or newer (there is no
+    build for Intel Macs);
+  - **windows-x86_64**, cross-compiled on Linux with
+    [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (UCRT), like the
+    fork's own Windows toolchains, and linked statically, so that they need
+    nothing but Windows 10 or newer. The aliases (`clang++.exe`, `ld.lld.exe`,
+    ...) are hard links in the archive, since unpacking symbolic links needs
+    privileges on Windows;
 - per target (`aarch64`, `arm` with the default soft-float multilib only,
   `x86_64`): compiler-rt (builtins, crt objects, ASan, TSan, UBSan) and the
   toolchain flavour of libc++ (`__h`), built against the sysroot of the
-  OpenHarmony 6.0 (API 20) SDK.
+  OpenHarmony 6.0 (API 20) SDK. They do not depend on the host, so they are
+  built once and are the same in every host's archive.
+
+The host tools need no libxml2, terminfo or zstd, and only the system's zlib
+(none on Windows, so lld there cannot read or write compressed debug sections).
 
 Not included, unlike the fork's prebuilts: the ndk libc++ flavour, lldb,
 clang-tools-extra, OpenMP, the other `arm` multilibs, and gwp_asan (which
@@ -133,13 +146,29 @@ scripts/build_toolchain.py host "$V" build/src build/work --linker lld
 OHOS_SDK_NATIVE=<sdk>/native scripts/build_toolchain.py target "$V" build/src build/work \
   aarch64-linux-ohos arm-linux-ohos x86_64-linux-ohos
 scripts/build_toolchain.py package "$V" build/src build/work dist
-scripts/ohos_toolchain.py validate "$V" linux-x86_64 --archive dist/clang_*.tar.gz --full --device
+scripts/ohos_toolchain.py validate "$V" linux-x86_64 --archive dist/clang_linux-*.tar.gz --full --device
 ```
+
+The Windows host tools are cross-compiled with an
+[llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases) release (the
+`ucrt-ubuntu` one; `build.yml` pins the version CI uses), and packaged with the
+target runtimes of the Linux build above:
+
+```sh
+scripts/build_toolchain.py host "$V" build/src build/work-windows --host windows-x86_64 --mingw <llvm-mingw>
+scripts/build_toolchain.py package "$V" build/src build/work dist \
+  --host windows-x86_64 --host-install build/work-windows/install
+```
+
+The macOS one is built the same way on an Apple silicon Mac, and packaged on
+Linux.
 
 The host stage takes about 3 CPU-hours (8 minutes on 32 cores), the target
 stage a few CPU-minutes. CI builds and validates every source-built version on
 pull requests that touch the build (`build.yml`), and again in the *Mirror
-release* workflow before publishing.
+release* workflow before publishing: the Linux archive with the full
+validation, including on the Oniro emulator, the others on their own systems,
+where their tools have to compile and link the tests.
 
 ## Adding or bumping a toolchain version
 

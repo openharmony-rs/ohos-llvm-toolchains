@@ -94,6 +94,16 @@
           "clang": {
             "file": "clang_linux-x86_64-7fda98-20260917.tar.gz"
           }
+        },
+        "darwin-arm64": {
+          "clang": {
+            "file": "clang_darwin-arm64-7fda98-20260917.tar.gz"
+          }
+        },
+        "windows-x86_64": {
+          "clang": {
+            "file": "clang_windows-x86_64-7fda98-20260917.tar.gz"
+          }
         }
       }
     }

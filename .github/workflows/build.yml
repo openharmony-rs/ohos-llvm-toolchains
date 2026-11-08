@@ -71,11 +71,10 @@ jobs:
           /opt/python/cp312-cp312/bin/pip install cmake ninja
       - name: Fetch the source and apply the patches
         run: python3 scripts/build_toolchain.py source "$VERSION" build/src
+      # With gcc-toolset's ld: the image's ld.gold is the base system's, too old for the
+      # --dependency-file that CMake passes when the default linker supports it.
       - name: Build clang, lld and the LLVM tools
-        run: |
-          linker=()
-          if command -v ld.gold > /dev/null; then linker=(--linker gold); fi
-          python3 scripts/build_toolchain.py host "$VERSION" build/src build/work "${linker[@]}"
+        run: python3 scripts/build_toolchain.py host "$VERSION" build/src build/work
       - name: Check the glibc requirement
         run: |
           newest=$(objdump -T build/work/install/bin/* build/work/install/lib/libclang.so* 2> /dev/null \

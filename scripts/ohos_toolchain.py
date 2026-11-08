@@ -12,7 +12,7 @@ qemu-user (aarch64, static) and, with --device, on a real OpenHarmony system
 (e.g. the Oniro emulator) via hdc, including dynamic loading of the
 toolchain's own libc++.so.
 
-Stdlib only; external tools used: tar, and hdc/qemu when requested.
+Stdlib only; external tools used: hdc/qemu when requested.
 """
 
 import argparse
@@ -22,6 +22,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.request
@@ -100,11 +101,10 @@ def fetch_archive(work: Path, base: str, version: str, host_dir: str, entry: dic
 
 
 def extract_archive(work: Path, archive: Path) -> Path:
-    top = subprocess.run(
-        ["tar", "tzf", str(archive)], capture_output=True, text=True, check=True
-    ).stdout.splitlines()[0].split("/")[0]
-    if not (work / top).is_dir():
-        subprocess.run(["tar", "xzf", str(archive), "-C", str(work)], check=True)
+    with tarfile.open(archive) as tar:
+        top = tar.next().name.split("/")[0]
+        if not (work / top).is_dir():
+            tar.extractall(work, **({"filter": "tar"} if hasattr(tarfile, "tar_filter") else {}))
     return work / top
 
 
@@ -342,17 +342,18 @@ def run_full(args, entry, clang_dir: Path, c: Checker, work: Path):
                 lib = clang_dir / "lib" / triple / "libc++.so" if src.suffix == ".cpp" else None
                 ok, out = device_run(device, dev_shared, marker, lib)
                 c.check(f"{src.name}: shared binary runs on device", ok, out)
-        if device is not None:
-            run_sanitizer_tests(args, entry, clang_dir, c, work, device, sysroot)
+        run_sanitizer_tests(args, entry, clang_dir, c, work, device, sysroot)
     finally:
         if device is not None:
             hdc(device, "shell", f"rm -rf {DEVICE_DIR}")
 
 
-def run_sanitizer_tests(args, entry, clang_dir: Path, c: Checker, work: Path, device: str, sysroot: Path):
+def run_sanitizer_tests(args, entry, clang_dir: Path, c: Checker, work: Path, device: str | None,
+                        sysroot: Path):
     """Each tests/sanitizers/<sanitizer>-*.c has to make the sanitizer print every
     `ohos-expect:` line on the device, with the toolchain's shared runtime pushed
-    alongside. Only for toolchains whose manifest entry lists the sanitizer."""
+    alongside; without a device, it only has to compile and link. Only for
+    toolchains whose manifest entry lists the sanitizer."""
     triple = args.device_target
     resource_dirs = sorted((clang_dir / "lib" / "clang").iterdir())
     c.check("exactly one clang resource directory", len(resource_dirs) == 1, str(resource_dirs))
@@ -377,7 +378,7 @@ def run_sanitizer_tests(args, entry, clang_dir: Path, c: Checker, work: Path, de
             str(tool(clang_dir, args.host, "clang")), f"--target={triple}", f"--sysroot={sysroot}",
             "-fuse-ld=lld", *flags, str(src), "-o", str(out),
         ])
-        if p.returncode != 0:
+        if p.returncode != 0 or device is None:
             continue
         ok, text = device_run(device, out, expected[0], runtime, require_success=False)
         c.check(f"{src.name}: {sanitizer} sanitizer reports on device",

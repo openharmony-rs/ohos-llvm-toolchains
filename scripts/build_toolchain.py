@@ -6,26 +6,34 @@ pinned commit, plus this repository's patches from patches/<version>/.
 
 Subcommands, normally run in this order:
   source <version> <dir>                       check out the fork and apply the patches
-  host <version> <src> <work>                  clang, lld and the LLVM tools for the build host
+  host <version> <src> <work>                  clang, lld and the LLVM tools for a host
   target <version> <src> <work> <triple>...    compiler-rt and libc++ for OpenHarmony targets
-  package <version> <src> <work> <outdir>      the release archive and SHA256SUMS
+  package <version> <src> <work> <outdir>      the release archive of a host, and SHA256SUMS
 
 The output has the layout of the fork's prebuilt toolchains, reduced to what
 cargo-ohos uses: clang, lld, the LLVM binutils, libclang, and per target the
 compiler-rt runtimes (including the sanitizers) and the toolchain flavour of
-libc++ (ABI namespace `__h`). Only a linux-x86_64 host is supported.
+libc++ (ABI namespace `__h`).
+
+Hosts: linux-x86_64 and darwin-arm64 are built on themselves, windows-x86_64
+is cross-compiled on Linux with llvm-mingw (`--mingw`), like the fork's own
+Windows toolchains.
 
 The target runtimes are built against the sysroot of an OpenHarmony SDK
 (`--ohos-sdk-native`, default `$OHOS_SDK_NATIVE`), like the applications that
-use them.
+use them. They do not depend on the host, so they are built once, with the
+linux-x86_64 host tools, and `package --host-install` combines them with the
+host tools of another host.
 """
 
 import argparse
+import filecmp
 import gzip
 import hashlib
 import io
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -35,6 +43,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = REPO_ROOT / "toolchains.json"
 PATCHES_DIR = REPO_ROOT / "patches"
+
+HOSTS = ["linux-x86_64", "darwin-arm64", "windows-x86_64"]
+MACOS_DEPLOYMENT_TARGET = "11.0"
+MINGW_TRIPLE = "x86_64-w64-mingw32"
+# MinGW's import library for libclang.dll, of no use to MSVC programs. cargo-ohos
+# would take lib/ for the directory of libclang.dll because of it.
+WINDOWS_EXCLUDED = {"lib/libclang.dll.a"}
 
 # The tools cargo-ohos resolves, plus what clang itself runs or ships.
 DISTRIBUTION_COMPONENTS = [
@@ -82,6 +97,20 @@ def cmake(src: Path, build: Path, defines: dict, targets: list[str] | None = Non
     run(["ninja", "-C", build] + (targets or []))
 
 
+def native_host() -> str | None:
+    return {
+        ("Linux", "x86_64"): "linux-x86_64",
+        ("Darwin", "arm64"): "darwin-arm64",
+    }.get((platform.system(), platform.machine()))
+
+
+def host_specific(rel: Path) -> bool:
+    """Whether a path of an install belongs to its host (the programs and libclang)
+    rather than to the OpenHarmony targets."""
+    return rel.parts[0] == "bin" or (
+        rel.parts[0] == "lib" and len(rel.parts) == 2 and rel.name.startswith("libclang"))
+
+
 def clang_major(src: Path) -> str:
     for line in (src / "cmake" / "Modules" / "LLVMVersion.cmake").read_text().splitlines():
         if "LLVM_VERSION_MAJOR" in line and "set(" in line:
@@ -105,10 +134,38 @@ def cmd_source(args):
     return 0
 
 
+def mingw_defines(mingw: Path) -> dict:
+    """Cross-compiling for Windows with llvm-mingw, linked statically so that the
+    programs need nothing but the system's DLLs (the UCRT)."""
+    bin_dir = mingw / "bin"
+    return {
+        "CMAKE_SYSTEM_NAME": "Windows",
+        "CMAKE_SYSTEM_PROCESSOR": "x86_64",
+        "CMAKE_C_COMPILER": bin_dir / f"{MINGW_TRIPLE}-clang",
+        "CMAKE_CXX_COMPILER": bin_dir / f"{MINGW_TRIPLE}-clang++",
+        "CMAKE_RC_COMPILER": bin_dir / f"{MINGW_TRIPLE}-windres",
+        "CMAKE_AR": bin_dir / "llvm-ar",
+        "CMAKE_RANLIB": bin_dir / "llvm-ranlib",
+        "CMAKE_FIND_ROOT_PATH": mingw / MINGW_TRIPLE,
+        "CMAKE_FIND_ROOT_PATH_MODE_PROGRAM": "NEVER",
+        "CMAKE_FIND_ROOT_PATH_MODE_LIBRARY": "ONLY",
+        "CMAKE_FIND_ROOT_PATH_MODE_INCLUDE": "ONLY",
+        "CMAKE_FIND_ROOT_PATH_MODE_PACKAGE": "ONLY",
+        "CMAKE_EXE_LINKER_FLAGS": "-static",
+        "CMAKE_SHARED_LINKER_FLAGS": "-static",
+        "CMAKE_MODULE_LINKER_FLAGS": "-static",
+        "LLVM_HOST_TRIPLE": "x86_64-w64-windows-gnu",
+        # llvm-mingw has no zlib.
+        "LLVM_ENABLE_ZLIB": "OFF",
+    }
+
+
 def cmd_host(args):
     entry = load_entry(args.version)
     src = Path(args.src).resolve()
     work = Path(args.work).resolve()
+    native = native_host()
+    host = args.host or native
     defines = {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_INSTALL_PREFIX": work / "install",
@@ -122,7 +179,8 @@ def cmd_host(args):
         "LLVM_INCLUDE_TESTS": "OFF",
         "LLVM_INCLUDE_BENCHMARKS": "OFF",
         "LLVM_INCLUDE_EXAMPLES": "OFF",
-        "LLVM_STATIC_LINK_CXX_STDLIB": "ON",
+        # Linking clang, lld or libclang takes GBs; the CI runners have 7 to 16 GB.
+        "LLVM_PARALLEL_LINK_JOBS": "2",
         "CLANG_DEFAULT_LINKER": "lld",
         # The fork's OpenHarmony driver features (TSan support, the libcxx-ohos
         # header directory, ...) are compiled in only with this.
@@ -132,6 +190,17 @@ def cmd_host(args):
         "LLVM_FORCE_VC_REVISION": entry["source"]["commit"],
         "LLVM_DISTRIBUTION_COMPONENTS": ";".join(DISTRIBUTION_COMPONENTS),
     }
+    if host == "windows-x86_64":
+        if not args.mingw:
+            sys.exit("error: the windows-x86_64 host is cross-compiled: pass --mingw <llvm-mingw dir>")
+        defines.update(mingw_defines(Path(args.mingw).resolve()))
+    elif host == native == "linux-x86_64":
+        defines["LLVM_STATIC_LINK_CXX_STDLIB"] = "ON"
+    elif host == native == "darwin-arm64":
+        defines["CMAKE_OSX_ARCHITECTURES"] = "arm64"
+        defines["CMAKE_OSX_DEPLOYMENT_TARGET"] = MACOS_DEPLOYMENT_TARGET
+    else:
+        sys.exit(f"error: cannot build the {host} host tools on {native or 'this machine'}")
     if args.linker:
         defines["LLVM_USE_LINKER"] = args.linker
     if shutil.which("ccache"):
@@ -286,10 +355,37 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def package_files(host: str, install: Path, host_install: Path) -> dict[Path, Path]:
+    """The archive's files, relative path -> source: the host-specific ones from
+    the host's install, the rest from the install the target runtimes went into."""
+    files = {}
+    for path in sorted(host_install.rglob("*")):
+        rel = path.relative_to(host_install)
+        if host_specific(rel):
+            if not (host == "windows-x86_64" and rel.as_posix() in WINDOWS_EXCLUDED):
+                files[rel] = path
+            continue
+        if host_install == install:
+            continue
+        other = install / rel
+        same = other.is_dir() if path.is_dir() else other.is_file() and filecmp.cmp(path, other, shallow=False)
+        if not same:
+            sys.exit(f"error: {rel} of the {host} host install is not in {install}, or differs")
+    for path in sorted(install.rglob("*")):
+        rel = path.relative_to(install)
+        if not host_specific(rel):
+            files[rel] = path
+    return files
+
+
 def cmd_package(args):
     entry = load_entry(args.version)
+    host = args.host
+    if host not in entry["hosts"]:
+        sys.exit(f"error: {MANIFEST.name} has no {host} host for {args.version}")
     src = Path(args.src).resolve()
     install = Path(args.work).resolve() / "install"
+    host_install = Path(args.host_install).resolve() if args.host_install else install
     out = Path(args.outdir).resolve()
     out.mkdir(parents=True, exist_ok=True)
 
@@ -299,6 +395,7 @@ def cmd_package(args):
         "BUILD_INFO.json": (json.dumps({
             "version": args.version,
             "llvm_version": entry["llvm_version"],
+            "host": host,
             "source": entry["source"],
             "built_by": "https://github.com/openharmony-rs/ohos-llvm-toolchains",
             "note": "Built from the OpenHarmony LLVM fork's source with the patches in patches/, "
@@ -318,19 +415,35 @@ def cmd_package(args):
         info.mtime = mtime
         return info
 
-    archive = out / entry["hosts"]["linux-x86_64"]["clang"]["file"]
+    # Windows cannot create symbolic links without privileges, so there the
+    # aliases (clang++, ld.lld, ...) become hard links, after all the files.
+    hard_links = []
+    archive = out / entry["hosts"][host]["clang"]["file"]
     with open(archive, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=mtime) as gz, \
             tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
         tar.add(install, arcname="llvm", recursive=False, filter=normalize)
-        for path in sorted(install.rglob("*")):
-            tar.add(path, arcname=f"llvm/{path.relative_to(install)}", recursive=False, filter=normalize)
+        for rel, path in sorted(package_files(host, install, host_install).items()):
+            arcname = f"llvm/{rel.as_posix()}"
+            if host == "windows-x86_64" and path.is_symlink():
+                info = normalize(tarfile.TarInfo(arcname))
+                info.type = tarfile.LNKTYPE
+                info.linkname = f"llvm/{path.resolve().relative_to(host_install).as_posix()}"
+                info.mode = 0o755
+                hard_links.append(info)
+            else:
+                tar.add(path, arcname=arcname, recursive=False, filter=normalize)
+        for info in hard_links:
+            tar.addfile(info)
         for name, data in sorted(extra.items()):
             info = normalize(tarfile.TarInfo(f"llvm/{name}"))
             info.size = len(data)
             info.mode = 0o644
             tar.addfile(info, io.BytesIO(data))
-    (out / "SHA256SUMS").write_text(f"{sha256_file(archive)}  {archive.name}\n")
     print(f"== wrote {archive} ({archive.stat().st_size >> 20} MiB)")
+
+    archives = sorted(out / h["clang"]["file"] for h in entry["hosts"].values()
+                      if (out / h["clang"]["file"]).is_file())
+    (out / "SHA256SUMS").write_text("".join(f"{sha256_file(a)}  {a.name}\n" for a in archives))
     return 0
 
 
@@ -347,6 +460,8 @@ def main():
     h.add_argument("version")
     h.add_argument("src")
     h.add_argument("work")
+    h.add_argument("--host", choices=HOSTS, help="the host to build for (default: this machine)")
+    h.add_argument("--mingw", help="llvm-mingw toolchain to cross-compile the windows-x86_64 host with")
     h.add_argument("--linker", help="LLVM_USE_LINKER for the host build, e.g. lld or gold "
                    "(default: the compiler's)")
     h.set_defaults(func=cmd_host)
@@ -365,6 +480,9 @@ def main():
     p.add_argument("src")
     p.add_argument("work")
     p.add_argument("outdir")
+    p.add_argument("--host", choices=HOSTS, default="linux-x86_64", help="the host of the archive")
+    p.add_argument("--host-install", help="the install of `host --host <host>`, if it is not "
+                   "the one in <work> that the target runtimes went into")
     p.set_defaults(func=cmd_package)
 
     args = parser.parse_args()
